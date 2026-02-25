@@ -37,6 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    use_swiglu: bool = False # whether to use SwiGLU instead of regular MLP
+    use_parallel_layer: bool = False # whether to use parallel attention and MLP instead of sequential
 
 
 def norm(x):
@@ -118,6 +120,31 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class SwiGLU(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # The paper assumes bias is added
+        # The number of hidden units is reduced by 2/3 to keep the 
+        # total FLOPs the same as a regular MLP with the same n_embd
+        self.W = nn.Linear(config.n_embd, 2 // 3 * 4 * config.n_embd)
+        self.V = nn.Linear(config.n_embd, 2 // 3 * 4 * config.n_embd)
+        self.proj = nn.Linear(2 // 3 * 4 * config.n_embd, config.n_embd)
+
+    def forward(self, x):
+        swish = F.silu(self.W(x)) # Paper assumed \beta=1.0, so we can just use SiLU as the activation
+        x = swish * self.V(x)
+        x = self.proj(x)
+        return x
+
+class ParallelLayerBlock(nn.Module):
+    def __init__(self, config, layer_idx, use_swiglu):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = SwiGLU(config) if use_swiglu else MLP(config)
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        return x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache) + self.mlp(norm(x))
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -132,10 +159,10 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, use_swiglu):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = SwiGLU(config) if use_swiglu else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -162,7 +189,11 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList(
+                    [ParallelLayerBlock(config, layer_idx, config.use_swiglu) if config.use_parallel_layer 
+                    else Block(config, layer_idx, config.use_swiglu) 
+                    for layer_idx in range(config.n_layer)]
+                ),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
