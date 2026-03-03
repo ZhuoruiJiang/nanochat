@@ -137,6 +137,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     # Evaluate each task
     results = {}
     centered_results = {}
+    token_per_sec_results = {}
     for task in tasks:
         start_time = time.time()
         label = task['label']
@@ -158,8 +159,9 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         if max_per_task > 0:
             data = data[:max_per_task]
 
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy, tok_per_sec = evaluate_task(model, tokenizer, data, device, task_meta)
         results[label] = accuracy
+        token_per_sec_results[label] = tok_per_sec
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
@@ -170,6 +172,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     out = {
         "results": results,
         "centered_results": centered_results,
+        "token_per_sec": token_per_sec_results,
         "core_metric": core_metric
     }
     return out
@@ -293,14 +296,15 @@ def main():
         # Write CSV output
         if ddp_rank == 0:
             base_dir = get_base_dir()
-            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
+            output_csv_path = os.path.join(base_dir, "base_eval", f"{args.model_tag}_{model_slug}.csv")
             os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
             with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
-                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
+                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}, {'Tokens/sec':<10}\n")
                 for label in core_results["results"]:
                     acc = core_results["results"][label]
                     centered = core_results["centered_results"][label]
-                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
+                    tps = core_results["token_per_sec"][label]
+                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}, {tps:<10.2f}\n")
                 f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
             print0(f"\nResults written to: {output_csv_path}")
             print0(f"CORE metric: {core_results['core_metric']:.4f}")
