@@ -53,6 +53,9 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--use-swiglu", action="store_true", default=False, help="whether to use SwiGLU instead of regular MLP")
 parser.add_argument("--use-parallel-layer", action="store_true", default=False, help="whether to use parallel attention and MLP instead of sequential")
+parser.add_argument("--use-diff-attn", action="store_true", default=False, help="whether to use Differential Attention (cancels attention noise)")
+parser.add_argument("--use-gated-attn", action="store_true", default=False, help="whether to use per-head sigmoid gate after SDPA (Gated Attention, arXiv:2505.06708)")
+parser.add_argument("--gqa-ratio", type=int, default=1, help="Group-Query Attention ratio: n_kv_head = n_head // gqa_ratio (1 = full MHA, 4 = typical GQA)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -136,8 +139,12 @@ def build_model_meta(depth):
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=max(1, num_heads // args.gqa_ratio), n_embd=model_dim,
         window_pattern=args.window_pattern,
+        use_swiglu=args.use_swiglu,
+        use_parallel_layer=args.use_parallel_layer,
+        use_diff_attn=args.use_diff_attn,
+        use_gated_attn=args.use_gated_attn,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

@@ -15,6 +15,8 @@ Notable features:
 from functools import partial
 from dataclasses import dataclass
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +41,8 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     use_swiglu: bool = False # whether to use SwiGLU instead of regular MLP
     use_parallel_layer: bool = False # whether to use parallel attention and MLP instead of sequential
+    use_diff_attn: bool = False # whether to use Differential Attention (cancels attention noise)
+    use_gated_attn: bool = False # whether to use per-head sigmoid gate after SDPA (Gated Attention, NeurIPS 2025)
 
 
 def norm(x):
@@ -74,6 +78,22 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.use_diff_attn = config.use_diff_attn
+        # Per-head sigmoid gate applied after SDPA output (Gated Attention, arXiv:2505.06708)
+        # gate = sigmoid(W_g @ x), shape (B, T, n_head), multiplied into y before c_proj
+        self.attn_gate = nn.Linear(self.n_embd, self.n_head, bias=False) if config.use_gated_attn else None
+        if self.use_diff_attn:
+            assert self.head_dim % 2 == 0, "head_dim must be even for differential attention"
+            self.half_dim = self.head_dim // 2
+            # Learnable λ reparameterization vectors: λ = exp(λ_q1·λ_k1) - exp(λ_q2·λ_k2) + λ_init
+            # Initialized to zeros → at init: exp(0)-exp(0)+λ_init = λ_init ✓
+            self.lambda_q1 = nn.Parameter(torch.zeros(self.n_head, self.half_dim))
+            self.lambda_k1 = nn.Parameter(torch.zeros(self.n_head, self.half_dim))
+            self.lambda_q2 = nn.Parameter(torch.zeros(self.n_head, self.half_dim))
+            self.lambda_k2 = nn.Parameter(torch.zeros(self.n_head, self.half_dim))
+            # Layer-dependent init: λ_init(l) = 0.8 - 0.6·exp(-0.3·l), l=layer_idx (0-based)
+            lambda_init_val = 0.8 - 0.6 * math.exp(-0.3 * layer_idx)
+            self.register_buffer("lambda_init", torch.tensor(lambda_init_val), persistent=True)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -97,27 +117,126 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if not self.use_diff_attn:
+            if kv_cache is None:
+                # Training: causal attention with optional sliding window
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            else:
+                # Inference: use flash_attn_with_kvcache which handles cache management
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = flash_attn.flash_attn_with_kvcache(
+                    q, k_cache, v_cache,
+                    k=k, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                )
+                # Advance position after last layer processes
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+            y = self._diff_attn_forward(q, k, v, window_size, kv_cache, B, T)
+
+        # Per-head sigmoid gate: output = sigmoid(W_g @ x) ⊙ y (Gated Attention, arXiv:2505.06708)
+        if self.attn_gate is not None:
+            gate = torch.sigmoid(self.attn_gate(x))  # (B, T, n_head)
+            y = gate.unsqueeze(-1) * y               # (B, T, n_head, head_dim)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
+
+    def _compute_lambda(self):
+        """Per-head λ scalar via reparameterization. Returns shape (n_head,)."""
+        return (
+            torch.exp((self.lambda_q1 * self.lambda_k1).sum(dim=-1))
+            - torch.exp((self.lambda_q2 * self.lambda_k2).sum(dim=-1))
+            + self.lambda_init
+        )
+
+    def _diff_attn_forward(self, q, k, v, window_size, kv_cache, B, T):
+        """
+        Differential attention: output = (A1 - λ·A2) @ V, per-head RMSNorm, scaled by (1-λ_init).
+
+        q: (B, T, n_head, head_dim) — RoPE + QK norm already applied
+        k: (B, T, n_kv_head, head_dim)
+        v: (B, T, n_kv_head, head_dim)
+        Returns: y (B, T, n_head, head_dim)
+        """
+        half_dim = self.half_dim
+        scale = half_dim ** -0.5
+
+        # Split Q and K into two halves; V stays full head_dim
+        q1, q2 = q[..., :half_dim], q[..., half_dim:]      # (B,T,n_head,half_dim) each
+        k1, k2 = k[..., :half_dim], k[..., half_dim:]      # (B,T,n_kv_head,half_dim) each
+
+        if kv_cache is None:
+            # Training: use current sequence only
+            k1_used, k2_used, v_used = k1, k2, v
+            T_k = T
+        else:
+            # Inference: manually update KV cache and read full history
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            pos = kv_cache.cache_seqlens[0].item()
+            k_cache[:, pos:pos+T] = k   # writes both halves together
+            v_cache[:, pos:pos+T] = v
+            end = pos + T
+            k1_used = k_cache[:, :end, :, :half_dim]
+            k2_used = k_cache[:, :end, :, half_dim:]
+            v_used  = v_cache[:, :end]
+            T_k = end
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+
+        # GQA: expand KV heads to match query head count
+        groups = self.n_head // self.n_kv_head
+        if groups > 1:
+            k1_used = k1_used.repeat_interleave(groups, dim=2)
+            k2_used = k2_used.repeat_interleave(groups, dim=2)
+            v_used  = v_used.repeat_interleave(groups, dim=2)
+
+        # Transpose to (B, H, T, D) for batched matmul
+        q1t, q2t = q1.transpose(1, 2), q2.transpose(1, 2)           # (B,n_head,T,half_dim)
+        k1t, k2t = k1_used.transpose(1, 2), k2_used.transpose(1, 2) # (B,n_head,T_k,half_dim)
+        vt = v_used.transpose(1, 2)                                   # (B,n_head,T_k,head_dim)
+
+        # Attention logits
+        a1 = (q1t @ k1t.transpose(-2, -1)) * scale   # (B,n_head,T,T_k)
+        a2 = (q2t @ k2t.transpose(-2, -1)) * scale
+
+        # Causal + sliding window mask
+        device = q.device
+        q_abs = torch.arange(T_k - T, T_k, device=device)   # absolute positions of queries
+        k_pos = torch.arange(T_k, device=device)
+        causal_mask = k_pos.unsqueeze(0) <= q_abs.unsqueeze(1)   # (T, T_k)
+        left_w = window_size[0]
+        if left_w >= 0:
+            in_window = (q_abs.unsqueeze(1) - k_pos.unsqueeze(0)) <= left_w
+            mask = causal_mask & in_window
+        else:
+            mask = causal_mask
+        mask = mask.unsqueeze(0).unsqueeze(0)   # (1,1,T,T_k) for broadcast
+
+        neg_inf = torch.finfo(a1.dtype).min
+        a1 = a1.masked_fill(~mask, neg_inf)
+        a2 = a2.masked_fill(~mask, neg_inf)
+
+        # Softmax in float32 for stability
+        a1 = torch.softmax(a1.float(), dim=-1).to(q.dtype)
+        a2 = torch.softmax(a2.float(), dim=-1).to(q.dtype)
+
+        # Differential combination: (B,n_head,T,T_k) @ (B,n_head,T_k,head_dim) → (B,n_head,T,head_dim)
+        lam = self._compute_lambda().to(q.dtype).view(1, self.n_head, 1, 1)
+        y = (a1 - lam * a2) @ vt
+
+        # Per-head parameter-free RMSNorm (matches nanochat's norm() style)
+        y = norm(y)   # normalizes over last dim (head_dim)
+
+        # Scale by (1 - λ_init) for stable initialization
+        y = y * (1.0 - self.lambda_init.to(y.dtype))
+
+        return y.transpose(1, 2)   # (B, T, n_head, head_dim)
 
 
 class SwiGLU(nn.Module):
@@ -260,6 +379,22 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
+        # Gated attention: init to zero -> sigmoid(0) = 0.5 at start (neutral given c_proj=0)
+        for block in self.transformer.h:
+            if block.attn.attn_gate is not None:
+                torch.nn.init.zeros_(block.attn.attn_gate.weight)
+
+        # Differential attention: reinitialize lambda vectors and lambda_init buffer
+        # NOTE: __init__ runs on meta device so buffer values are not stored; must set them here
+        for block in self.transformer.h:
+            if block.attn.use_diff_attn:
+                torch.nn.init.zeros_(block.attn.lambda_q1)
+                torch.nn.init.zeros_(block.attn.lambda_k1)
+                torch.nn.init.zeros_(block.attn.lambda_q2)
+                torch.nn.init.zeros_(block.attn.lambda_k2)
+                lambda_init_val = 0.8 - 0.6 * math.exp(-0.3 * block.attn.layer_idx)
+                block.attn.lambda_init.fill_(lambda_init_val)
+
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -381,13 +516,20 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Collect differential attention lambda params (excluded from matrix_params / Muon)
+        lambda_params = []
+        if self.config.use_diff_attn:
+            for block in self.transformer.h:
+                a = block.attn
+                lambda_params.extend([a.lambda_q1, a.lambda_k1, a.lambda_q2, a.lambda_k2])
+        lambda_ids = {id(p) for p in lambda_params}
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in lambda_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(lambda_params))
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -402,6 +544,12 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        if lambda_params:
+            param_groups.append(dict(
+                kind='adamw', params=lambda_params,
+                lr=scalar_lr * dmodel_lr_scale,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
