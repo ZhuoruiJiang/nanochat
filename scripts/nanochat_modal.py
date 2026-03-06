@@ -10,8 +10,9 @@ Individual stages (if you want to re-run one step):
     modal run nanochat_modal.py::stage_pretrain
     modal run nanochat_modal.py::stage_post_pretrain_eval
     modal run nanochat_modal.py::stage_sft
+    modal run nanochat_modal.py::model_param
     modal run nanochat_modal.py::stage_rl          # optional
-    modal run nanochat_modal.py::stage_chat_sample
+    modal run nanochat_modal.py::stage_test_model  # one-shot prompt test
 
 Cost reference (8×H100 at ~$31/hr for the node)
 ------------------------------------------------
@@ -36,7 +37,7 @@ from modal import App, Image as ModalImage, Volume, Secret
 # CONFIGURATION
 # =============================================================================
 
-MODEL_TAG = "baseline512"  # baseline, swiglu, parallel -- used to tag checkpoints and eval results in the report
+MODEL_TAG = "parallel-24"  # baseline, swiglu, parallel, extend --used to tag checkpoints and eval results in the report
 
 # ── Model depth ──────────────────────────────────────────────────────────────
 #   d12  ~125M params   5 min on 8xH100    good for iterating on code changes
@@ -44,8 +45,7 @@ MODEL_TAG = "baseline512"  # baseline, swiglu, parallel -- used to tag checkpoin
 #   d24  ~768M params   3 hr on 8xH100     
 #   d26  ~1B params     6 hr on 8xH100 
 #   d32  ~1.9B params   41 hr on 8xH100
-# DEPTH = 24
-DEPTH = 12
+DEPTH = 24
 
 # ── Data shards ───────────────────────────────────────────────────────────────
 # FineWeb-EDU is split into 1822 parquet shards, each ~250M chars / ~100MB.
@@ -72,7 +72,7 @@ DEVICE_BATCH_SIZE = 16    # d24 at 16 is safe; 32 may OOM on some H100 configs
 
 # ── WandB ─────────────────────────────────────────────────────────────────────
 # Set to "dummy" to disable WandB logging
-WANDB_RUN = "d12" + "_" + MODEL_TAG
+WANDB_RUN = "d24" + "_" + MODEL_TAG
 
 # ── Volume mount path ──────────────────────────────────────────────────────────
 # All cached data (shards, tokenizer, checkpoints, eval bundle) lives here
@@ -378,8 +378,16 @@ def stage_pretrain(
             f"--model-tag={model_tag}",   # baseline, swiglu, parallel
             # "--use-swiglu",         # 490Part2, SiwLU activation with separate gating projection
             # "--use-parallel-layer", # 490Part2, parallel attention + FFN for faster training with large batch sizes
-            "--max-seq-len 512",
-            "----dataset_portion 0.0 0.8"
+            
+            # Part 3
+            # First checkpoint
+            # "--max-seq-len 512",
+            # "--dataset_portion 0.0 0.8",
+
+            # Continue from the checkpoint    
+            # "--resume-from-step 2205",
+            # "--num-iterations 2705",
+            # "--dataset_portion 0.8 1.0",
         ],
         nproc=_N_PRETRAIN_GPUS,
     )
@@ -525,6 +533,91 @@ def stage_sft(model_tag: str,wandb_run: str = WANDB_RUN) -> None:
     volume.commit()
     print("SFT complete.")
 
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    gpu="H100:1",
+    timeout=60 * 30,
+)
+def stage_test_model(
+    prompt: str = "",
+    source: str = "sft",
+    model_tag: str = MODEL_TAG,
+    step: int = -1,
+    checkpoint: str = "",
+    questions_file: str = "questions.txt",
+) -> None:
+    """
+    Run scripts.test_model against a chosen checkpoint.
+
+    Examples:
+        modal run nanochat_modal.py::stage_test_model
+        modal run nanochat_modal.py::stage_test_model --prompt "Explain backprop briefly."
+        modal run nanochat_modal.py::stage_test_model --questions-file questions.txt
+        modal run nanochat_modal.py::stage_test_model --source base --model-tag parallel-24 --step 2205
+        modal run nanochat_modal.py::stage_test_model --checkpoint /vol/nanochat_cache/chatsft_checkpoints/parallel-24/model_001200.pt
+    """
+    _setup_cache()
+
+    args = []
+    if prompt.strip():
+        args.append(f'--prompt "{prompt}"')
+    elif questions_file.strip():
+        args.append(f"--questions-file {questions_file.strip()}")
+    if checkpoint.strip():
+        args.append(f"--checkpoint {checkpoint.strip()}")
+    else:
+        args.extend([f"--source {source}", f"--model-tag {model_tag}"])
+        if step >= 0:
+            args.append(f"--step {step}")
+
+    mode = "prompt" if prompt.strip() else "questions-file"
+    print("Running checkpoint test:")
+    print(
+        f"  mode={mode} source={source} model_tag={model_tag} "
+        f"step={step} checkpoint={checkpoint or '<none>'} "
+        f"questions_file={questions_file or '<none>'}"
+    )
+    _python("scripts.test_model", args)
+
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    cpu=4,
+    memory=8192,
+    timeout=60 * 30,
+)
+def model_param(model_paths: str = "", step: int = -1) -> None:
+    """
+    Print parameter counts for one or more checkpoints.
+
+    Args:
+        model_paths: Comma-separated checkpoint paths. Each path can be a
+            checkpoint directory or a model_XXXXXX.pt file.
+            If empty, defaults to:
+                {NANOCHAT_CACHE}/base_checkpoints/{MODEL_TAG}
+        step: Optional step override for directory paths. Use -1 for latest.
+    """
+    _setup_cache()
+
+    if model_paths.strip():
+        paths = [p.strip() for p in model_paths.split(",") if p.strip()]
+    else:
+        paths = [os.path.join(NANOCHAT_CACHE, "base_checkpoints", MODEL_TAG)]
+
+    args = list(paths)
+    if step >= 0:
+        args.append(f"--step={step}")
+
+    print("Computing model parameter counts for:")
+    for p in paths:
+        print(f"  - {p}")
+    _python("scripts.model_size", args)
+
 # =============================================================================
 # FULL SPEEDRUN PIPELINE (main entrypoint)
 # =============================================================================
@@ -561,13 +654,13 @@ def main() -> None:
 
     # Stage 0: Data
     # speedrun.sh: python -m nanochat.dataset -n 240
-    # print("[0/5] Downloading FineWeb-EDU shards...")
-    # stage_data.remote(num_shards=NUM_SHARDS)
+    print("[0/5] Downloading FineWeb-EDU shards...")
+    stage_data.remote(num_shards=NUM_SHARDS)
 
     # Stage 1: Tokenizer
     # speedrun.sh: python -m scripts.tok_train && python -m scripts.tok_eval
-    # print("[1/5] Training tokenizer...")
-    # stage_tokenizer.remote()
+    print("[1/5] Training tokenizer...")
+    stage_tokenizer.remote()
 
     # Stage 2: Pretrain
     # speedrun.sh: python -m nanochat.report reset
@@ -578,15 +671,15 @@ def main() -> None:
     # Stage 3: Post-pretrain eval
     # speedrun.sh: torchrun ... -m scripts.base_loss
     #              torchrun ... -m scripts.base_eval
-    # print("[3/5] Evaluating base model (bits-per-byte + CORE)...")
-    # stage_post_pretrain_eval.remote(model_tag=MODEL_TAG)
+    print("[3/5] Evaluating base model (bits-per-byte + CORE)...")
+    stage_post_pretrain_eval.remote(model_tag=MODEL_TAG)
 
     # Stage 4: SFT + eval
     # speedrun.sh: curl identity_conversations.jsonl
     #              torchrun ... -m scripts.chat_sft -- --run=...
     #              torchrun ... -m scripts.chat_eval -- -i sft
-    # print("[4/5] Supervised fine-tuning + eval...")
-    # stage_sft.remote(wandb_run=WANDB_RUN, model_tag=MODEL_TAG)
+    print("[4/5] Supervised fine-tuning + eval...")
+    stage_sft.remote(wandb_run=WANDB_RUN, model_tag=MODEL_TAG)
 
     print("\n" + "=" * w)
     print("Speedrun complete!")

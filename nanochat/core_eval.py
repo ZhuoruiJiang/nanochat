@@ -10,6 +10,7 @@ import random
 from jinja2 import Template
 import torch
 import torch.distributed as dist
+import time
 
 # -----------------------------------------------------------------------------
 # Prompt rendering utilities
@@ -229,16 +230,20 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         predicted_tokens = predictions[0, si-1:ei-1]
         actual_tokens = input_ids[0, si:ei]
         is_correct = torch.all(predicted_tokens == actual_tokens).item()
+        # 490 part2: Throughput tracking 
+        num_tokens = ei - si
     elif task_type in ['multiple_choice', 'schema']:
         # For MC/schema: find the option with lowest average loss
         mean_losses = [losses[i, si-1:ei-1].mean().item()
                         for i, (si, ei) in enumerate(zip(start_idxs, end_idxs))]
         pred_idx = mean_losses.index(min(mean_losses))
         is_correct = pred_idx == item['gold']
+        # 490 part2: Throughput tracking 
+        num_tokens = input_ids.numel()
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
-    return is_correct
+    return is_correct, num_tokens
 
 
 def evaluate_task(model, tokenizer, data, device, task_meta):
@@ -249,14 +254,30 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+
+    # 490 part2: Throughput tracking
+    total_tokens = 0 
+    start_time = time.time()
+
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+        is_correct, num_tokens = evaluate_example(idx, model, tokenizer, data, device, task_meta)
         correct[idx] = float(is_correct)
+        total_tokens += num_tokens
+
     # sync results across all the processes if running distributed
     if world_size > 1:
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        # 490 part2: Throughput tracking
+        total_tokens_tensor = torch.tensor(total_tokens, device=device)
+        dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
+        total_tokens = total_tokens_tensor.item()
+
     # compute the mean
     mean_correct = correct.mean().item()
-    return mean_correct
+
+    elapsed = time.time() - start_time
+    tok_per_sec = total_tokens / elapsed
+
+    return mean_correct, tok_per_sec

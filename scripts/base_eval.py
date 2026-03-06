@@ -18,6 +18,9 @@ Examples:
 
     # Quick/approximate evaluation using a single GPU
     python -m scripts.base_eval --model-tag d24 --device-batch-size=16 --max-per-task=100 --split-tokens=524288
+
+    # Evaluate with shorter BPB eval batches (e.g. 512-token context)
+    python -m scripts.base_eval --model-tag d24 --eval-seq-len=512
 """
 import os
 import csv
@@ -189,6 +192,7 @@ def main():
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
+    parser.add_argument('--eval-seq-len', type=int, default=None, help='Override BPB eval sequence length (default: model max sequence length)')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
     args = parser.parse_args()
 
@@ -208,19 +212,28 @@ def main():
     is_hf_model = args.hf_path is not None
     if is_hf_model:
         model, tokenizer = load_hf_model(args.hf_path, device)
-        sequence_len = model.max_seq_len or 1024
+        default_sequence_len = model.max_seq_len or 1024
         token_bytes = get_hf_token_bytes(tokenizer, device=device)
         model_name = args.hf_path
         model_slug = args.hf_path.replace("/", "-")
     else:
         model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
-        sequence_len = meta["model_config"]["sequence_len"]
+        default_sequence_len = meta["model_config"]["sequence_len"]
         token_bytes = get_token_bytes(device=device)
         model_name = f"base_model (step {meta['step']})"
         model_slug = f"base_model_{meta['step']:06d}"
 
+    sequence_len = default_sequence_len if args.eval_seq_len is None else args.eval_seq_len
+    # if sequence_len <= 0:
+    #     parser.error("--eval-seq-len must be a positive integer")
+    # if sequence_len > default_sequence_len:
+    #     parser.error(
+    #         f"--eval-seq-len={sequence_len} exceeds model max sequence length ({default_sequence_len})"
+    #     )
+
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
+    print0(f"BPB eval sequence length: {sequence_len}")
 
     # Results to log
     core_results = None
