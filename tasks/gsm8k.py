@@ -107,11 +107,170 @@ class GSM8K(Task):
         is_correct = int(pred_num == ref_num)
         return is_correct
 
-    def reward(self, conversation, assistant_response):
+    def reward(self, conversation, assistant_response, reward_type="binary"):
         """
-        Used during RL. To keep things simple, just re-use the evaluation above.
-        Later this could be made more complex (e.g. format matching etc.)
+        Used during RL.
+
+        reward_type:
+          - "binary": 1.0 if correct, 0.0 otherwise (original behavior)
+          - "distance": continuous reward based on numeric closeness to the ground truth
         """
-        is_correct = self.evaluate(conversation, assistant_response)
-        is_correct_float = float(is_correct)
-        return is_correct_float
+        assert isinstance(assistant_response, str), "Assuming simple string response for now"
+        assistant_message = conversation['messages'][-1]
+        last_text_part = assistant_message['content'][-1]['text']
+        ref_num = extract_answer(last_text_part)
+        pred_num = extract_answer(assistant_response)
+
+        if reward_type == "binary":
+            return float(pred_num == ref_num)
+
+        elif reward_type == "distance":
+            if pred_num is None:
+                return 0.0  # no parseable answer
+            if ref_num is None:
+                return 0.0  # shouldn't happen, but be safe
+            try:
+                ref_val = float(ref_num)
+                pred_val = float(pred_num)
+            except ValueError:
+                return 0.0
+            if ref_val == pred_val:
+                return 1.0
+            # Reward = 1 / (1 + relative_error), clamped to [0, 1]
+            denom = max(abs(ref_val), 1.0)  # avoid div-by-zero when ref is 0
+            relative_error = abs(pred_val - ref_val) / denom
+            return 1.0 / (1.0 + relative_error)
+
+        elif reward_type == "reasoning":
+            # A. Core accuracy reward
+            if pred_num is not None and ref_num is not None and pred_num == ref_num:
+                score = 1.0
+            else:
+                score = -1.0
+
+            # B. Format & termination reward (anti-degeneration)
+            has_format = bool(GSM_RE.search(assistant_response))
+            if has_format:
+                score += 0.2
+            else:
+                score -= 1.0  # heavy penalty for degeneration / hitting max tokens
+
+            # C. N-gram repetition penalty
+            words = assistant_response.split()
+            if len(words) >= 5:
+                max_run = 1
+                current_run = 1
+                for i in range(1, len(words)):
+                    if words[i].lower() == words[i - 1].lower():
+                        current_run += 1
+                        max_run = max(max_run, current_run)
+                    else:
+                        current_run = 1
+                if max_run >= 5:
+                    score -= 0.5
+
+            # D. Parsimony / length penalty
+            num_tokens = len(assistant_response.split())
+            score -= 0.001 * num_tokens
+
+            return score
+        
+        elif reward_type == "hallucination":
+            if pred_num is not None and ref_num is not None and pred_num == ref_num:
+                score = 1.0
+            else:
+                score = -1.0
+            
+            # Hallucinated operand penalty (grounding reward)
+            # Seed the available number pool from the user's question
+            NUM_RE = re.compile(r'-?\d+(?:\.\d+)?')
+            user_question = conversation['messages'][0]['content']
+            available_numbers = set(NUM_RE.findall(user_question))
+
+            # Collect all <|python_start|> and <|output_start|> blocks with positions
+            all_blocks = []
+            for m in re.finditer(r'<\|python_start\|>(.*?)<\|python_end\|>', assistant_response, re.DOTALL):
+                all_blocks.append(('python', m.start(), m.group(1)))
+            for m in re.finditer(r'<\|output_start\|>(.*?)<\|output_end\|>', assistant_response, re.DOTALL):
+                all_blocks.append(('output', m.start(), m.group(1)))
+
+            # Process blocks sequentially by position in the response
+            for block_type, _, content in sorted(all_blocks, key=lambda x: x[1]):
+                if block_type == 'output':
+                    # A completed calculation's result becomes available for future steps
+                    available_numbers.update(NUM_RE.findall(content))
+                elif block_type == 'python':
+                    # Penalise every number in the expression not traceable to prompt or prior outputs
+                    for num in NUM_RE.findall(content):
+                        if num not in available_numbers:
+                            score -= 0.5
+
+            return score
+        
+        elif reward_type == "combined":
+            # A. Accuracy: distance-based continuous score mapped to [-1.0, +1.0]
+            #    (upgrades binary ±1.0 from reasoning/reasoning2 with smooth gradient signal)
+            if pred_num is None or ref_num is None:
+                score = -1.0
+            else:
+                try:
+                    ref_val = float(ref_num)
+                    pred_val = float(pred_num)
+                except ValueError:
+                    score = -1.0
+                else:
+                    if ref_val == pred_val:
+                        distance_score = 1.0
+                    else:
+                        denom = max(abs(ref_val), 1.0)
+                        relative_error = abs(pred_val - ref_val) / denom
+                        distance_score = 1.0 / (1.0 + relative_error)
+                    score = 2.0 * distance_score - 1.0  # map [0, 1] → [-1, +1]
+
+            # B. Format & termination reward (anti-degeneration)
+            has_format = bool(GSM_RE.search(assistant_response))
+            if has_format:
+                score += 0.2
+            else:
+                score -= 1.0
+
+            # C. N-gram repetition penalty
+            words = assistant_response.split()
+            if len(words) >= 5:
+                max_run = 1
+                current_run = 1
+                for i in range(1, len(words)):
+                    if words[i].lower() == words[i - 1].lower():
+                        current_run += 1
+                        max_run = max(max_run, current_run)
+                    else:
+                        current_run = 1
+                if max_run >= 5:
+                    score -= 0.5
+
+            # D. Parsimony / length penalty
+            score -= 0.001 * len(assistant_response.split())
+
+            # E. Hallucinated operand penalty (grounding reward)
+            NUM_RE = re.compile(r'-?\d+(?:\.\d+)?')
+            user_question = conversation['messages'][0]['content']
+            available_numbers = set(NUM_RE.findall(user_question))
+
+            all_blocks = []
+            for m in re.finditer(r'<\|python_start\|>(.*?)<\|python_end\|>', assistant_response, re.DOTALL):
+                all_blocks.append(('python', m.start(), m.group(1)))
+            for m in re.finditer(r'<\|output_start\|>(.*?)<\|output_end\|>', assistant_response, re.DOTALL):
+                all_blocks.append(('output', m.start(), m.group(1)))
+
+            for block_type, _, content in sorted(all_blocks, key=lambda x: x[1]):
+                if block_type == 'output':
+                    available_numbers.update(NUM_RE.findall(content))
+                elif block_type == 'python':
+                    for num in NUM_RE.findall(content):
+                        if num not in available_numbers:
+                            score -= 0.5
+
+            return score
+
+        else:
+            raise ValueError(f"Unknown reward_type: {reward_type!r}")

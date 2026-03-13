@@ -9,13 +9,16 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
 import argparse
+import csv
+import os
+import re
 from functools import partial
 from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type, get_base_dir
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -28,6 +31,62 @@ from tasks.spellingbee import SpellingBee
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
+_GSM8K_ANSWER_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+
+def _extract_gsm8k_answer(text):
+    if not isinstance(text, str):
+        return ""
+    match = _GSM8K_ANSWER_RE.search(text)
+    if not match:
+        return ""
+    match_str = match.group(1).strip().replace(",", "")
+    return match_str
+
+def _get_gsm8k_reference_answer(conversation):
+    assistant_message = conversation["messages"][-1]
+    content = assistant_message.get("content")
+    if isinstance(content, list) and content:
+        last_text_part = content[-1].get("text", "")
+    elif isinstance(content, str):
+        last_text_part = content
+    else:
+        last_text_part = ""
+    return _extract_gsm8k_answer(last_text_part) or last_text_part
+
+def _maybe_write_gsm8k_csvs(correct_rows, incorrect_rows, ddp, ddp_rank, ddp_world_size):
+    if ddp:
+        gathered_correct = [None for _ in range(ddp_world_size)]
+        gathered_incorrect = [None for _ in range(ddp_world_size)]
+        dist.all_gather_object(gathered_correct, correct_rows)
+        dist.all_gather_object(gathered_incorrect, incorrect_rows)
+        correct_rows = [row for shard in gathered_correct for row in shard]
+        incorrect_rows = [row for shard in gathered_incorrect for row in shard]
+
+    if ddp_rank != 0:
+        return
+
+    if not correct_rows and not incorrect_rows:
+        return
+
+    output_dir = os.path.join(get_base_dir(), "chat_eval")
+    os.makedirs(output_dir, exist_ok=True)
+    correct_path = os.path.join(output_dir, "gsm8k_correct.csv")
+    incorrect_path = os.path.join(output_dir, "gsm8k_incorrect.csv")
+    fieldnames = ["question", "answer", "prediction"]
+
+    with open(correct_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(correct_rows)
+
+    with open(incorrect_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(incorrect_rows)
+
+    print0(f"GSM8K CSV written: {correct_path}")
+    print0(f"GSM8K CSV written: {incorrect_path}")
+
 def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
@@ -37,6 +96,9 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
     # Run the evaluation
     num_passed, total = 0, 0
+    collect_gsm8k = isinstance(task_object, GSM8K)
+    gsm8k_correct_rows = []
+    gsm8k_incorrect_rows = []
     for i in range(ddp_rank, num_problems, ddp_world_size):
         conversation = task_object[i]
 
@@ -56,6 +118,25 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         # Evaluate success criteria
         outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
         passed = any(outcomes)
+
+        if collect_gsm8k:
+            selected_completion = completions[0]
+            if passed:
+                for completion, outcome in zip(completions, outcomes):
+                    if outcome:
+                        selected_completion = completion
+                        break
+            question = conversation["messages"][0]["content"]
+            ref_answer = _get_gsm8k_reference_answer(conversation)
+            row = {
+                "question": question,
+                "answer": ref_answer,
+                "prediction": selected_completion,
+            }
+            if passed:
+                gsm8k_correct_rows.append(row)
+            else:
+                gsm8k_incorrect_rows.append(row)
 
         # Keep stats
         total += 1
@@ -78,6 +159,15 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
     print0("=" * 50)
     print0(f"Final: {num_passed}/{total} ({100*num_passed/total:.2f}%)")
+
+    if collect_gsm8k:
+        _maybe_write_gsm8k_csvs(
+            gsm8k_correct_rows,
+            gsm8k_incorrect_rows,
+            ddp=ddp,
+            ddp_rank=ddp_rank,
+            ddp_world_size=ddp_world_size,
+        )
 
     # Return the accuracy
     return num_passed/total

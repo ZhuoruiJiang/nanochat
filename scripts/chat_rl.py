@@ -40,6 +40,8 @@ parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloa
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+# Checkpoint tagging
+parser.add_argument("--new-tag", type=str, default=None, help="new model tag to use for checkpoints")
 # Training horizon
 parser.add_argument("--num-epochs", type=int, default=1, help="number of epochs over GSM8K")
 # Batch sizes / sampling
@@ -128,7 +130,7 @@ def get_batch():
             # Decode the generated response
             generated_text = tokenizer.decode(generated_tokens)
             # Calculate the reward
-            reward = train_task.reward(conversation, generated_text)
+            reward = train_task.reward(conversation, generated_text, reward_type="combined")
             rewards.append(reward)
 
         # Pad the sequences so that their lengths (in time) match
@@ -316,7 +318,7 @@ for step in range(num_steps):
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
         depth = model.config.n_layer
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
+        output_dirname = args.new_tag if args.new_tag else (args.model_tag if args.model_tag else f"d{depth}")
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
         model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
         save_checkpoint(

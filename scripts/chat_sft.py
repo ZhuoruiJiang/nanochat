@@ -27,7 +27,10 @@ from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
 from tasks.common import TaskMixture
+from tasks.alpaca import Alpaca
+from tasks.codealpaca import CodeAlpaca
 from tasks.gsm8k import GSM8K
+from tasks.metamathqa import MetaMathQA
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
@@ -42,6 +45,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
+parser.add_argument("--new-tag", type=str, default=None, help="save the model with a new tag")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
 # Training horizon
@@ -67,6 +71,9 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--alpaca-epochs", type=int, default=1, help="number of epochs of Alpaca in training mixture (uses a reproducible 40% train subset)")
+parser.add_argument("--codealpaca-epochs", type=int, default=2, help="number of epochs of CodeAlpaca in training mixture (uses the full train split)")
+parser.add_argument("--metamathqa-epochs", type=int, default=1, help="number of epochs of MetaMathQA in training mixture (uses a reproducible 80K train subset)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -159,6 +166,9 @@ for group in optimizer.param_groups:
 # SFT data mixture and DataLoader
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_tasks = [
+    *[Alpaca(split="train") for _ in range(args.alpaca_epochs)], # 52K
+    *[CodeAlpaca(split="train") for _ in range(args.codealpaca_epochs)], # 20K
+    *[MetaMathQA(split="train") for _ in range(args.metamathqa_epochs)], # 50K subsample of MetaMathQA train
     SmolTalk(split="train"), # 460K rows of general conversations
     CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
     CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
@@ -168,7 +178,11 @@ train_tasks = [
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
 ]
 train_dataset = TaskMixture(train_tasks)
-print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
+print0(
+    f"Training mixture: {len(train_dataset):,} rows "
+    f"(Alpaca x{args.alpaca_epochs}, CodeAlpaca x{args.codealpaca_epochs}, "
+    f"MetaMathQA x{args.metamathqa_epochs}, MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})"
+)
 val_dataset = TaskMixture([
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
@@ -383,7 +397,12 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
+        output_dirname = f"d{depth}" # e.g. d12
+        if args.model_tag:
+            output_dirname = args.model_tag
+        if args.new_tag:
+            output_dirname = args.new_tag
+        # output_dirname = args.model_tag if args.model_tag else f"d{depth}" 
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,

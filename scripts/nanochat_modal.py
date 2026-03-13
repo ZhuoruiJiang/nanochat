@@ -37,7 +37,7 @@ from modal import App, Image as ModalImage, Volume, Secret
 # CONFIGURATION
 # =============================================================================
 
-MODEL_TAG = "parallel-24"  # baseline, swiglu, parallel, extend --used to tag checkpoints and eval results in the report
+MODEL_TAG = "baseline24"  # baseline, swiglu, parallel, extend --used to tag checkpoints and eval results in the report
 
 # ── Model depth ──────────────────────────────────────────────────────────────
 #   d12  ~125M params   5 min on 8xH100    good for iterating on code changes
@@ -58,7 +58,7 @@ NUM_SHARDS = 240
 # "A100:8" = 8 A100 80GBs, ~10-20% slower than H100s but sometimes cheaper.
 # Single GPU works too — code auto-compensates with gradient accumulation.
 GPU_PRETRAIN = "H100:8"
-GPU_FINETUNE = "H100:4"   # SFT and RL don't need all 8 GPUs
+GPU_FINETUNE = "H100:8"   # SFT and RL don't need all 8 GPUs
 
 # ── Device batch size ─────────────────────────────────────────────────────────
 # Sequences per GPU per forward pass. Reduce if you hit OOM.
@@ -86,7 +86,7 @@ NANOCHAT_CACHE = f"{VOLUME_MOUNT}/nanochat_cache"  # mirrors $NANOCHAT_BASE_DIR
 # Modal kills a container after this many seconds of wall-clock time.
 # The pretrain timeout must be longer than your expected training time.
 PRETRAIN_TIMEOUT_SEC  = 60 * 60 * 6    # 6 hours
-FINETUNE_TIMEOUT_SEC  = 60 * 60 * 2    # 2 hours (SFT and RL are much shorter)
+FINETUNE_TIMEOUT_SEC  = 60 * 60 * 4    # 2 hours (SFT and RL are much shorter)
 DOWNLOAD_TIMEOUT_SEC  = 60 * 90        # 90 min for shard download
 
 # ── Derived: GPU count ────────────────────────────────────────────────────────
@@ -375,19 +375,8 @@ def stage_pretrain(
             f"--device-batch-size={device_batch_size}",
             f"--run={wandb_run}",
             "--save-every=1000",    # checkpoint every 1k steps for resilience
-            f"--model-tag={model_tag}",   # baseline, swiglu, parallel
-            # "--use-swiglu",         # 490Part2, SiwLU activation with separate gating projection
-            # "--use-parallel-layer", # 490Part2, parallel attention + FFN for faster training with large batch sizes
-            
-            # Part 3
-            # First checkpoint
-            # "--max-seq-len 512",
-            # "--dataset_portion 0.0 0.8",
-
-            # Continue from the checkpoint    
-            # "--resume-from-step 2205",
-            # "--num-iterations 2705",
-            # "--dataset_portion 0.8 1.0",
+            f"--model-tag={model_tag}",   # baseline24
+            "--resume-from-step 6000",
         ],
         nproc=_N_PRETRAIN_GPUS,
     )
@@ -514,9 +503,28 @@ def stage_sft(model_tag: str,wandb_run: str = WANDB_RUN) -> None:
             f"--run={wandb_run}",
             f"--model-tag={model_tag}",   # baseline, swiglu, parallel
             "--load-optimizer 0",
+
+            f"--new-tag={model_tag}_originalsft",
+            "--alpaca-epochs=0",
+            "--codealpaca-epochs=0",
+            "--metamathqa-epochs=0",
         ],
         nproc=_N_FINETUNE_GPUS,
     )
+
+# =============================================================================
+# STAGE 5: POST SFT EVALUATION
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    gpu=GPU_FINETUNE,
+    timeout=FINETUNE_TIMEOUT_SEC,
+)
+def stage_sft_eval(model_tag: str, source: str="sft") -> None:
+    _setup_cache()
 
     # speedrun.sh: torchrun ... -m scripts.chat_eval -- -i sft
     # -i sft tells chat_eval to load the SFT checkpoint (not base or rl)
@@ -524,16 +532,71 @@ def stage_sft(model_tag: str,wandb_run: str = WANDB_RUN) -> None:
     _torchrun(
         "scripts.chat_eval", 
         [
-            "-i", 
-            "sft",
-            f"--model-tag={model_tag}",   # baseline, swiglu, parallel
+            f"--model-tag={model_tag}",     # baseline, swiglu, parallel
+            f"--source={source}",           # sft, base, rl
+            # '--task-name="ARC-Easy|ARC-Challenge|HumanEval"',
         ], 
         nproc=_N_FINETUNE_GPUS)
 
     volume.commit()
-    print("SFT complete.")
+    print("SFT Eval complete.")
 
+# =============================================================================
+# STAGE 6: REINFORCEMENT LEARNING (optional)
+# =============================================================================
 
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    gpu=GPU_FINETUNE,
+    timeout=FINETUNE_TIMEOUT_SEC,
+)
+def stage_rl(model_tag:str, wandb_run: str = WANDB_RUN, new_tag: str=None) -> None:
+    """
+    Optional RL stage to boost math reasoning on GSM8K.
+
+    speedrun.sh:
+        torchrun ... -m scripts.chat_rl -- --run=$WANDB_RUN
+        torchrun ... -m scripts.chat_eval -- -i rl
+
+    Uses a simplified GRPO/REINFORCE variant trained on GSM8K math word
+    problems. The model generates multiple candidate answers, checks each
+    against the ground truth integer, and uses correct/incorrect as a binary
+    reward signal. No value network, no KL penalty against the SFT reference.
+
+    From the source comment: "I put GRPO in quotes because we actually end up
+    with something a lot simpler and more similar to just REINFORCE."
+
+    Expected improvement: GSM8K accuracy ~5% (SFT) -> ~15-20% (after RL).
+
+    This stage is NOT part of the default speedrun.sh -- it's an optional
+    extension. Run it separately after stage_sft:
+        modal run nanochat_modal.py::stage_rl
+    """
+    _setup_cache()
+
+    print("Running RL (GRPO on GSM8K)...")
+    # speedrun.sh: torchrun ... -m scripts.chat_rl -- --run=$WANDB_RUN
+    _torchrun(
+        "scripts.chat_rl",
+        [
+            f"--run={wandb_run}",
+            # "--model-step=4357",
+            f"--model-tag={model_tag}",
+            f"--new-tag={new_tag}",
+        ],
+        nproc=_N_FINETUNE_GPUS,
+    )
+
+    # speedrun.sh: torchrun ... -m scripts.chat_eval -- -i rl
+    print("Evaluating RL checkpoint...")
+    _torchrun("scripts.chat_eval", ["-i", "rl"], nproc=_N_FINETUNE_GPUS)
+
+    volume.commit()
+    print("RL complete.")
+
+    
 @app.function(
     image=image,
     secrets=[secret],
@@ -654,32 +717,36 @@ def main() -> None:
 
     # Stage 0: Data
     # speedrun.sh: python -m nanochat.dataset -n 240
-    print("[0/5] Downloading FineWeb-EDU shards...")
-    stage_data.remote(num_shards=NUM_SHARDS)
+    # print("[0/5] Downloading FineWeb-EDU shards...")
+    # stage_data.remote(num_shards=NUM_SHARDS)
 
     # Stage 1: Tokenizer
     # speedrun.sh: python -m scripts.tok_train && python -m scripts.tok_eval
-    print("[1/5] Training tokenizer...")
-    stage_tokenizer.remote()
+    # print("[1/5] Training tokenizer...")
+    # stage_tokenizer.remote()
 
     # Stage 2: Pretrain
     # speedrun.sh: python -m nanochat.report reset
     #              torchrun ... -m scripts.base_train -- --depth=24 ...
-    print("[2/5] Pretraining base model (the long one)...")
-    stage_pretrain.remote(depth=DEPTH, device_batch_size=DEVICE_BATCH_SIZE, wandb_run=WANDB_RUN, model_tag=MODEL_TAG)
+    # print("[2/5] Pretraining base model (the long one)...")
+    # stage_pretrain.remote(depth=DEPTH, device_batch_size=DEVICE_BATCH_SIZE, wandb_run=WANDB_RUN, model_tag=MODEL_TAG)
 
     # Stage 3: Post-pretrain eval
     # speedrun.sh: torchrun ... -m scripts.base_loss
     #              torchrun ... -m scripts.base_eval
-    print("[3/5] Evaluating base model (bits-per-byte + CORE)...")
-    stage_post_pretrain_eval.remote(model_tag=MODEL_TAG)
+    # print("[3/5] Evaluating base model (bits-per-byte + CORE)...")
+    # stage_post_pretrain_eval.remote(model_tag=MODEL_TAG)
 
-    # Stage 4: SFT + eval
+    # Stage 4: SFT
     # speedrun.sh: curl identity_conversations.jsonl
     #              torchrun ... -m scripts.chat_sft -- --run=...
     #              torchrun ... -m scripts.chat_eval -- -i sft
-    print("[4/5] Supervised fine-tuning + eval...")
-    stage_sft.remote(wandb_run=WANDB_RUN, model_tag=MODEL_TAG)
+    # print("[4/5] Supervised fine-tuning")
+    # stage_sft.remote(wandb_run=WANDB_RUN, model_tag=MODEL_TAG)
+
+    # Stage 5: SFT Eval
+    print("[4/5] SFT Eval")
+    stage_sft_eval.remote(model_tag=MODEL_TAG)
 
     print("\n" + "=" * w)
     print("Speedrun complete!")
